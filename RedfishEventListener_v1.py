@@ -165,6 +165,33 @@ class RedfishEventListenerServer(BaseHTTPRequestHandler):
 
         return True
 
+    def _read_chunked_body(self):
+        """Read an HTTP chunked transfer-encoded body from self.rfile.
+
+        Returns:
+            bytes: The reassembled body
+        """
+        body = b""
+        while True:
+            # Read the chunk-size line (hex digits followed by CRLF)
+            line = self.rfile.readline()
+            if not line:
+                break
+            chunk_size = int(line.strip(), 16)
+            if chunk_size == 0:
+                # Terminal chunk; consume optional trailers + final CRLF
+                while True:
+                    trailer = self.rfile.readline()
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+            # Read exactly chunk_size bytes of data
+            chunk = self.rfile.read(chunk_size)
+            body += chunk
+            # Consume the CRLF after the chunk data
+            self.rfile.readline()
+        return body
+
     def _read_request_body(self):
         """Read the request body, handling both Content-Length and chunked encoding.
 
@@ -174,11 +201,16 @@ class RedfishEventListenerServer(BaseHTTPRequestHandler):
         Raises:
             ValueError: If neither Content-Length nor Transfer-Encoding is present
         """
-        # Content-Length path (original behavior)
-        if "content-length" in self.headers:
+        transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+
+        if "chunked" in transfer_encoding:
+            my_logger.info("{} - Reading chunked body".format(self.client_address[0]))
+            return self._read_chunked_body()
+        elif "content-length" in self.headers:
             length = int(self.headers["Content-Length"])
             return self.rfile.read(length)
-        raise ValueError("No Content-Length or Transfer-Encoding header")
+        else:
+            raise ValueError("No Content-Length or Transfer-Encoding header")
 
     def do_POST(self):
         # Validate authentication
