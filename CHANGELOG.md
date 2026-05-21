@@ -1,5 +1,10 @@
 # Change Log
 
+## [1.1.8] - 2026-05-21
+- Added HTTP/1.1 chunked transfer encoding support per RFC 7230
+- Refactored handler for testability (extracted `parse_list`, `load_config`, `_validate_auth`, `_read_request_body`)
+- Added comprehensive unit test suite (60 tests, 100% coverage)
+
 ## [1.1.7] - 2026-05-01
 - Added optional HTTP Basic Authentication support
 - Modified the web server to use HTTP/1.1 as the protocol version

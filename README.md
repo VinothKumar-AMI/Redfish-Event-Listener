@@ -76,6 +76,19 @@ Received event details will be captured on the console and recorded into a file 
 
 The tool can be stopped by issuing a keyboard interrupt (CTRL-C).
 
+## Chunked Transfer Encoding
+
+The listener supports both `Content-Length` and `Transfer-Encoding: chunked` request bodies per RFC 7230.  Redfish services that send events using chunked encoding will be handled correctly.
+
+## Running Tests
+
+The project includes a comprehensive test suite.  To run the tests:
+
+```
+pip install -r requirements-dev.txt
+python -m pytest tests/ -v --cov=. --cov-report=term-missing
+```
+
 ## Limitations
 
 * The subscription information remains the same for all the subscriptions initiated from the tool.
