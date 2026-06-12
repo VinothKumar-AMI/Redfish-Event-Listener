@@ -15,6 +15,7 @@ from redfish import redfish_client
 import redfish_utilities
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import base64
+from configparser import ConfigParser
 
 my_logger = logging.getLogger()
 my_logger.setLevel(logging.DEBUG)
@@ -48,6 +49,81 @@ config = {
 
 event_count = {}
 
+
+def parse_list(string: str):
+    """Parse a bracketed, comma-separated string into a list."""
+    string = string.strip()
+    if re.fullmatch(r'\[\s*\]', string.strip()) or len(string.strip()) == 0:
+        return []
+    if string[0] == '[' and string[-1] == ']':
+        string = string.strip('[]')
+    return [x.strip().strip("'\"") for x in string.split(',')]
+
+
+def load_config(config_path, verbose=0):
+    """Load and return the config dict from an INI file.
+
+    Returns:
+        dict: Merged config dictionary
+    """
+    parsed_config = ConfigParser()
+    parsed_config.read(config_path)
+
+    cfg = dict(config)
+
+    # Host Info
+    cfg['listenerip'] = parsed_config.get('SystemInformation', 'ListenerIP')
+    cfg['listenerport'] = parsed_config.getint('SystemInformation', 'ListenerPort')
+    cfg['usessl'] = parsed_config.getboolean('SystemInformation', 'UseSSL')
+
+    # Cert Info
+    if cfg['usessl']:
+        cfg['certfile'] = parsed_config.get('CertificateDetails', 'certfile')
+        cfg['keyfile'] = parsed_config.get('CertificateDetails', 'keyfile')
+
+    # Listener Authentication
+    if parsed_config.has_section('ListenerAuthentication'):
+        cfg['listener_username'] = parsed_config.get('ListenerAuthentication', 'UserName')
+        cfg['listener_password'] = parsed_config.get('ListenerAuthentication', 'Password')
+
+    # Subscription Details
+    # Note: Older versions of the tool contained a spelling error for 'Subscription'; need to support both variants to maintain compatibility with older config files
+    if parsed_config.has_section("SubsciptionDetails") and parsed_config.has_section("SubscriptionDetails"):
+        my_logger.error('Use either SubsciptionDetails or SubscriptionDetails in config, not both.')
+        sys.exit(1)
+    my_config_key = "SubsciptionDetails" if parsed_config.has_section("SubsciptionDetails") else "SubscriptionDetails"
+    cfg['destination'] = parsed_config.get(my_config_key, 'Destination')
+    if parsed_config.has_option(my_config_key, 'Context'):
+        cfg['contextdetail'] = parsed_config.get(my_config_key, 'Context')
+    if parsed_config.has_option(my_config_key, 'EventTypes'):
+        cfg['eventtypes'] = parse_list(parsed_config.get(my_config_key, 'EventTypes'))
+    if parsed_config.has_option(my_config_key, 'Format'):
+        cfg['format'] = parsed_config.get(my_config_key, 'Format')
+    if parsed_config.has_option(my_config_key, 'Expand'):
+        cfg['expand'] = parsed_config.get(my_config_key, 'Expand')
+    if parsed_config.has_option(my_config_key, 'ResourceTypes'):
+        cfg['resourcetypes'] = parse_list(parsed_config.get(my_config_key, 'ResourceTypes'))
+    if parsed_config.has_option(my_config_key, 'Registries'):
+        cfg['registries'] = parse_list(parsed_config.get(my_config_key, 'Registries'))
+    for k in ['format', 'expand', 'resourcetypes', 'registries', 'contextdetail', 'eventtypes']:
+        if cfg[k] in ['', [], None]:
+            cfg[k] = None
+
+    # Subscription Targets
+    cfg['serverIPs'] = parse_list(parsed_config.get('ServerInformation', 'ServerIPs'))
+    cfg['usernames'] = parse_list(parsed_config.get('ServerInformation', 'UserNames'))
+    cfg['passwords'] = parse_list(parsed_config.get('ServerInformation', 'Passwords'))
+    cfg['logintype'] = ['Session' for x in cfg['serverIPs']]
+    if parsed_config.has_option('ServerInformation', 'LoginType'):
+        cfg['logintype'] = parse_list(parsed_config.get('ServerInformation', 'LoginType'))
+        cfg['logintype'] += ['Session'] * (len(cfg['serverIPs']) - len(cfg['logintype']))
+
+    # Other Info
+    cfg['verbose'] = verbose
+
+    return cfg
+
+
 class RedfishEventListenerServer(BaseHTTPRequestHandler):
     """
     Redfish Event Listener Server
@@ -56,47 +132,114 @@ class RedfishEventListenerServer(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
-    def do_POST(self):
-        # Check if Authorization header exists
+    def _validate_auth(self):
+        """Validate Basic Authentication if an Authorization header is present.
+
+        Returns:
+            bool: True if auth passes or no auth required, False if rejected
+        """
         auth_header = self.headers.get("Authorization")
 
-        # Only validate credentials if Authorization header is present
-        if auth_header:
-            if not auth_header.startswith("Basic "):
-                self.send_response(401)
-                self.send_header("WWW-Authenticate", "Basic realm=\"Redfish Listener\"")
-                self.end_headers()
-                self.wfile.write(b"Unauthorized: Invalid Authorization header format")
-                return
+        if not auth_header:
+            return True
 
-            # Decode Basic Auth
-            encoded_credentials = auth_header.split(" ", 1)[1]
-            decoded_credentials = base64.b64decode(encoded_credentials).decode("utf-8")
-            username, password = decoded_credentials.split(":", 1)
+        if not auth_header.startswith("Basic "):
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", "Basic realm=\"Redfish Listener\"")
+            self.end_headers()
+            self.wfile.write(b"Unauthorized: Invalid Authorization header format")
+            return False
 
-            # Validate credentials
-            if username != config['listener_username'] or password != config['listener_password']:
-                self.send_response(403)
-                self.end_headers()
-                self.wfile.write(b"Forbidden: Invalid credentials")
-                logging.info("Invalid Credentials")
-                return
+        # Decode Basic Auth
+        encoded_credentials = auth_header.split(" ", 1)[1]
+        decoded_credentials = base64.b64decode(encoded_credentials).decode("utf-8")
+        username, password = decoded_credentials.split(":", 1)
 
-        # Check for the content length
+        # Validate credentials
+        if username != config['listener_username'] or password != config['listener_password']:
+            self.send_response(403)
+            self.end_headers()
+            self.wfile.write(b"Forbidden: Invalid credentials")
+            logging.info("Invalid Credentials")
+            return False
+
+        return True
+
+    def _read_chunked_body(self):
+        """Read an HTTP chunked transfer-encoded body from self.rfile.
+
+        Returns:
+            bytes: The reassembled body
+        """
+        body = b""
+        while True:
+            # Read the chunk-size line (hex digits followed by CRLF)
+            line = self.rfile.readline()
+            if not line:
+                break
+            chunk_size = int(line.strip(), 16)
+            if chunk_size == 0:
+                # Terminal chunk; consume optional trailers + final CRLF
+                while True:
+                    trailer = self.rfile.readline()
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+            # Read exactly chunk_size bytes of data
+            chunk = self.rfile.read(chunk_size)
+            body += chunk
+            # Consume the CRLF after the chunk data
+            self.rfile.readline()
+        return body
+
+    def _read_request_body(self):
+        """Read the request body, handling both Content-Length and chunked encoding.
+
+        Returns:
+            bytes: The raw request body
+
+        Raises:
+            ValueError: If neither Content-Length nor Transfer-Encoding is present
+        """
+        transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+
+        if "chunked" in transfer_encoding:
+            my_logger.info("{} - Reading chunked body".format(self.client_address[0]))
+            return self._read_chunked_body()
+        elif "content-length" in self.headers:
+            length = int(self.headers["Content-Length"])
+            return self.rfile.read(length)
+        else:
+            raise ValueError("No Content-Length or Transfer-Encoding header")
+
+    def do_POST(self):
+        # Validate authentication
+        if not self._validate_auth():
+            return
+
+        # Read the request body
         try:
-            length = int(self.headers["content-length"])
-        except:
-            my_logger.error("{} - No Content-Length header".format(self.client_address[0]))
+            raw_body = self._read_request_body()
+        except ValueError:
+            my_logger.error("{} - No Content-Length or Transfer-Encoding header".format(
+                self.client_address[0]))
             self.send_response(411)
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        except Exception:
+            my_logger.error("{} - Error reading request body".format(self.client_address[0]))
+            self.send_response(400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
 
-        # Read the data
+        # Parse the JSON payload
         try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-        except:
-            my_logger.error("{} - No data received or data is not JSON".format(self.client_address[0]))
+            payload = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            my_logger.error("{} - No data received or data is not JSON".format(
+                self.client_address[0]))
             self.send_response(400)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -189,69 +332,7 @@ if __name__ == '__main__':
     argget.add_argument('-v', '--verbose', action='count', default=0, help='Verbose output')
     args = argget.parse_args()
 
-    # Initiate Configuration File
-    from configparser import ConfigParser
-    parsed_config = ConfigParser()
-    parsed_config.read(args.config)
-
-    # Inline helper to help parse lists into arrays
-    def parse_list(string: str):
-        string = string.strip()
-        if re.fullmatch(r'\[\s*\]', string.strip()) or len(string.strip()) == 0:
-            return []
-        if string[0] == '[' and string[-1] == ']':
-            string = string.strip('[]')
-        return [x.strip().strip("'\"") for x in string.split(',')]
-
-    # Host Info
-    config['listenerip'] = parsed_config.get('SystemInformation', 'ListenerIP')
-    config['listenerport'] = parsed_config.getint('SystemInformation', 'ListenerPort')
-    config['usessl'] = parsed_config.getboolean('SystemInformation', 'UseSSL')
-
-    # Cert Info
-    if config['usessl']:
-        config['certfile'] = parsed_config.get('CertificateDetails', 'certfile')
-        config['keyfile'] = parsed_config.get('CertificateDetails', 'keyfile')
-
-    # Listener Authentication
-    if parsed_config.has_section('ListenerAuthentication'):
-        config['listener_username'] = parsed_config.get('ListenerAuthentication', 'UserName')
-        config['listener_password'] = parsed_config.get('ListenerAuthentication', 'Password')
-
-    # Subscription Details
-    # Note: Older versions of the tool contained a spelling error for 'Subscription'; need to support both variants to maintain compatibility with older config files
-    if parsed_config.has_section("SubsciptionDetails") and parsed_config.has_section("SubscriptionDetails"):
-        my_logger.error('Use either SubsciptionDetails or SubscriptionDetails in config, not both.')
-        sys.exit(1)
-    my_config_key = "SubsciptionDetails" if parsed_config.has_section("SubsciptionDetails") else "SubscriptionDetails"
-    config['destination'] = parsed_config.get(my_config_key, 'Destination')
-    if parsed_config.has_option(my_config_key, 'Context'):
-        config['contextdetail'] = parsed_config.get(my_config_key, 'Context')
-    if parsed_config.has_option(my_config_key, 'EventTypes'):
-        config['eventtypes'] = parse_list(parsed_config.get(my_config_key, 'EventTypes'))
-    if parsed_config.has_option(my_config_key, 'Format'):
-        config['format'] = parsed_config.get(my_config_key, 'Format')
-    if parsed_config.has_option(my_config_key, 'Expand'):
-        config['expand'] = parsed_config.get(my_config_key, 'Expand')
-    if parsed_config.has_option(my_config_key, 'ResourceTypes'):
-        config['resourcetypes'] = parse_list(parsed_config.get(my_config_key, 'ResourceTypes'))
-    if parsed_config.has_option(my_config_key, 'Registries'):
-        config['registries'] = parse_list(parsed_config.get(my_config_key, 'Registries'))
-    for k in ['format', 'expand', 'resourcetypes', 'registries', 'contextdetail', 'eventtypes']:
-        if config[k] in ['', [], None]:
-            config[k] = None
-
-    # Subscription Targets
-    config['serverIPs'] = parse_list(parsed_config.get('ServerInformation', 'ServerIPs'))
-    config['usernames'] = parse_list(parsed_config.get('ServerInformation', 'UserNames'))
-    config['passwords'] = parse_list(parsed_config.get('ServerInformation', 'Passwords'))
-    config['logintype'] = ['Session' for x in config['serverIPs']]
-    if parsed_config.has_option('ServerInformation', 'LoginType'):
-        config['logintype'] = parse_list(parsed_config.get('ServerInformation', 'LoginType'))
-        config['logintype'] += ['Session'] * (len(config['serverIPs']) - len(config['logintype']))
-
-    # Other Info
-    config['verbose'] = args.verbose
+    config = load_config(args.config, verbose=args.verbose)
     if config['verbose']:
         print(json.dumps(config, indent=4))
 
