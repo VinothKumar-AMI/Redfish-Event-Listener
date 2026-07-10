@@ -126,6 +126,10 @@ Expand = false
 ResourceTypes = ["Chassis"]
 Registries = ["ResourceEvent"]
 
+[ListenerAuthentication]
+UserName = username
+Password = password
+
 [ServerInformation]
 ServerIPs = ["https://<RedfishIP1>","https://<RedfishIP2>"]
 UserNames = ["Username1","Username2"]
